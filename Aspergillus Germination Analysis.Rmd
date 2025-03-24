@@ -1,0 +1,145 @@
+---
+title: "Aspergillus Germination Analysis"
+author: "Maryam Ijadpanahsaravi"
+date: '2025-03-24'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+📦 Packages and Setup
+```{r}
+pkgs <- c("dplyr", "readxl", "data.table", "ggplot2", "tidyr",
+          "Metrics", "growthrates", "openxlsx", "zoo", "reshape2", "stringr")
+lapply(pkgs, library, character.only = TRUE)
+
+data_path <- "data/raw/"
+output_path <- "results/"
+
+```
+📂 Load and Combine CSV Files
+```{r}
+csv_files <- list.files(path = data_path, pattern = "*.csv", full.names = TRUE)
+
+read_data <- function(file) {
+  df <- read.csv(file) %>%
+    dplyr::select(ObjectId, time, Area, Circularity, well, species, treatment, rep) %>%
+    mutate(filename = basename(file))
+  return(df)
+}
+
+df_raw <- bind_rows(lapply(csv_files, read_data))
+
+```
+📄 Merge Metadata
+```{r}
+meta <- read_excel("data/oCellolist.xlsx") %>%
+  mutate(well = as.factor(well))
+
+df <- left_join(df_raw, meta, by = "well") %>%
+  filter(!is.na(rep))
+
+```
+🚫 Filter False Positives
+```{r}
+df_false <- df %>%
+  group_by(ObjectId) %>%
+  mutate(threshold = ifelse(Area > 300, 1, 0),
+         threshold = na_if(threshold, 0),
+         threshold = na.locf0(threshold),
+         false_hit = ifelse(Area < lag(Area) & threshold == 1, 1, 0)) %>%
+  filter(false_hit > 0) %>%
+  ungroup()
+
+df_clean <- df %>%
+  filter(!ObjectId %in% unique(df_false$ObjectId))
+
+```
+🧠 Germination Classification: R, S, G
+```{r}
+df_classified <- df_clean %>%
+  group_by(ObjectId) %>%
+  mutate(
+    InitialArea = first(Area, na.rm = TRUE),
+    InitialCircularity = first(Circularity, na.rm = TRUE),
+    PercentIncrease = ((Area - InitialArea) / InitialArea) * 100,
+    CircularityChange = abs(Circularity - InitialCircularity) / InitialCircularity
+  ) %>%
+  mutate(
+    R = ifelse(CircularityChange < 0.1 & PercentIncrease < 10, 1, 0),
+    S = ifelse(CircularityChange < 0.1 & PercentIncrease >= 10, 1, 0),
+    G = ifelse(CircularityChange >= 0.1 & PercentIncrease >= 50, 1, 0),
+    missing = ifelse(is.na(Area) & sum(S + G) == 0, 1, 0)
+  ) %>%
+  mutate(across(c(R, S, G), ~na_if(., 0))) %>%
+  mutate(R = na.locf0(R), S = na.locf0(S), G = na.locf0(G)) %>%
+  ungroup() %>%
+  mutate(status = case_when(G == 1 ~ 2, S == 1 & is.na(G) ~ 1, TRUE ~ 0),
+         S = ifelse(status > 0, 1, 0),
+         G = ifelse(status > 1, 1, 0))
+
+```
+📊 Summarize R/S/G per Time & Well
+```{r}
+summary_table <- df_classified %>%
+  group_by(well, time) %>%
+  summarise(
+    R = sum(R, na.rm = TRUE),
+    S = sum(S, na.rm = TRUE),
+    G = sum(G, na.rm = TRUE),
+    missing = sum(missing, na.rm = TRUE),
+    total = n_distinct(ObjectId)
+  ) %>%
+  ungroup()
+
+```
+🔁 Reshape and Normalize for Modeling
+```{r}
+long_format <- summary_table %>%
+  pivot_longer(cols = c(S, G), names_to = "phase", values_to = "count") %>%
+  mutate(percent = (count / total) * 100,
+         time_h = time / 60)
+
+```
+📈 Asymmetric Model Function
+```{r}
+assymetric_mod <- function(time, parms) {
+  with(as.list(parms), {
+    y <- Pmax * (1 - (1 / (1 + (time / theta)^d)))
+    return(as.matrix(data.frame(time = time, y = y)))
+  })
+}
+attr(assymetric_mod,"pnames") <- c("Pmax","theta", "d")
+attr(assymetric_mod,"fname") <- "assymetric_mod"
+attr(assymetric_mod,"class") <- c("growthmodel", "function")
+
+```
+🧪 Fit Model
+```{r}
+fits <- all_growthmodels(percent ~ time_h | phase + well,
+                         data = long_format,
+                         FUN = assymetric_mod,
+                         p = c(Pmax = 50 ,theta = 8, d = 4),
+                         lower = c(Pmax = 0 ,theta = 1, d = 1),
+                         upper = c(Pmax = 120 ,theta = 20, d = 30),
+                         which = c("Pmax", "theta", "d"),
+                         method = "Marq",
+                         ncores = 2)
+
+```
+📉 Plot Fits
+```{r}
+pdf(file = paste0(output_path, "germination_fits.pdf"))
+par(mfrow = c(2, 3))
+plot(fits, ylim = c(0, 100), xlim = c(0, 24))
+dev.off()
+
+```
+📤 Export Model Results
+```{r}
+model_summary <- results(fits)
+write.csv(model_summary, paste0(output_path, Sys.Date(), "_model_results.csv"))
+
+```
+
